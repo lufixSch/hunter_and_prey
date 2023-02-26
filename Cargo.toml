@@ -11,6 +11,10 @@ repository = "https://github.com/lufixSch/hunter_and_prey"
 
 [dependencies]
 bevy = { version = "0.9.1", features = ["dynamic"] }
+bevy-inspector-egui = "0.17.0"
+bevy_sepax2d = { verison="0.4.1", features= ["debug"] }
+rand = "0.8.5"
+sepax2d = "0.3.8"
 
 # Enable a small amount of optimization in debug mode
 [profile.dev]
