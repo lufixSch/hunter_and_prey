@@ -1,4 +1,5 @@
 use bevy::ecs::change_detection::Mut;
+use bevy::math::Vec3Swizzles;
 use bevy::prelude::{Input, IntoSystemDescriptor, KeyCode, Query, Res, SystemSet, With};
 use bevy::time::Time;
 use bevy::{
@@ -9,12 +10,8 @@ use bevy::{
     sprite::{ColorMaterial, Material2d, MaterialMesh2dBundle, Mesh2dHandle, Sprite, SpriteBundle},
 };
 
-use bevy_sepax2d::{
-    prelude::{Movable, Sepax},
-    Convex,
-};
+use bevy_rapier2d::prelude::{Collider, Damping, Friction, Restitution, RigidBody, Velocity};
 use rand::random;
-use sepax2d::prelude::Circle as SepaxCircle;
 
 const HUNTER_COLOR: Color = Color::rgb(1.0, 0.0, 0.0);
 const PREY_COLOR: Color = Color::rgb(0.0, 0.0, 1.0);
@@ -25,6 +22,7 @@ const FIELD_SIZE: f32 = 600.0;
 
 const PREY_ENERGY_REDUCTION_RATE: f32 = 0.2;
 const PREY_ENERGY_PROPAGATION_RATE: f32 = 0.2;
+const ENERGY_THRESHHOLD: f32 = 0.1;
 
 const PREY_REPRODUCTION_RATE: f32 = 0.1;
 const HUNTER_REPRODUCTION_RATE: f32 = 0.5;
@@ -43,6 +41,7 @@ pub struct Creature {
     pub speed: f32,
     pub angular_speed: f32,
     pub energy: f32,
+    pub has_energy: bool,
     pub reproductivity: f32,
 }
 
@@ -52,24 +51,26 @@ impl Creature {
             speed: 0.0,
             angular_speed: 0.0,
             energy: 1.0,
+            has_energy: true,
             reproductivity: 0.0,
         }
     }
 
     pub fn set_speed(&mut self, speed: f32, angular_speed: f32) {
         self.speed = speed;
+
         self.angular_speed = angular_speed;
     }
 
-    pub fn perform_move(&mut self, delta_t: f32, mut transform: Mut<Transform>) {
-        let d_distance = self.speed * delta_t;
-        let d_angle = self.angular_speed * delta_t;
+    pub fn get_speed(&self) -> (f32, f32) {
+        (self.get_only_speed(), self.angular_speed)
+    }
 
-        transform.rotate_local_z(d_angle);
-
-        if (self.energy > 0.0) {
-            let v_distance = transform.local_y() * d_distance;
-            transform.translation += v_distance
+    pub fn get_only_speed(&self) -> f32 {
+        if self.has_energy {
+            self.speed
+        } else {
+            0.0
         }
     }
 
@@ -117,8 +118,11 @@ where
     name: CreatureName,
     creature: Creature,
     mesh: MaterialMesh2dBundle<T>,
-    collision: Sepax,
-    movable: Movable,
+    body: RigidBody,
+    collider: Collider,
+    velocity: Velocity,
+    damping: Damping,
+    friction: Friction,
 }
 
 impl<T> CreatureBundle<T>
@@ -132,36 +136,34 @@ where
         field_size: f32,
         size: f32,
     ) -> CreatureBundle<T> {
-        let position = random_position(field_size);
+        let position = Self::random_position(field_size);
 
         CreatureBundle {
+            body: RigidBody::Dynamic,
+            collider: Collider::ball(size / 2.0),
+            velocity: Velocity::zero(),
+            damping: Damping {
+                linear_damping: 10.0,
+                angular_damping: 10.0,
+            },
+            friction: Friction::coefficient(0.0),
             name: CreatureName(name),
             mesh: MaterialMesh2dBundle {
                 mesh: mesh,
                 material: material,
-                transform: Transform::from_translation(position).with_scale(Vec3 {
-                    x: size,
-                    y: size,
-                    z: 0.0,
-                }),
+                transform: Transform::from_translation(position),
                 ..default()
-            },
-            collision: Sepax {
-                convex: Convex::Circle(SepaxCircle::new((position.x, position.y), size)),
-            },
-            movable: Movable {
-                axes: vec![(0.0, 0.0)],
             },
             creature: Creature::new(),
         }
     }
-}
 
-fn random_position(field_size: f32) -> Vec3 {
-    let x: f32 = random::<f32>() * field_size - field_size / 2.0;
-    let y: f32 = random::<f32>() * field_size - field_size / 2.0;
+    fn random_position(field_size: f32) -> Vec3 {
+        let x: f32 = random::<f32>() * field_size - field_size / 2.0;
+        let y: f32 = random::<f32>() * field_size - field_size / 2.0;
 
-    return Vec3::new(x, y, 0.0);
+        return Vec3::new(x, y, 0.0);
+    }
 }
 
 fn add_hunter(
@@ -174,7 +176,9 @@ fn add_hunter(
             .spawn((
                 CreatureBundle::new(
                     "hunter_{n}".to_string(),
-                    meshes.add(shape::Circle::default().into()).into(),
+                    meshes
+                        .add(shape::Circle::new(CREATURE_SIZE / 2.0).into())
+                        .into(),
                     materials.add(ColorMaterial::from(HUNTER_COLOR)),
                     FIELD_SIZE,
                     CREATURE_SIZE,
@@ -197,7 +201,9 @@ fn add_prey(
             .spawn((
                 CreatureBundle::new(
                     "prey_{n}".to_string(),
-                    meshes.add(shape::Circle::default().into()).into(),
+                    meshes
+                        .add(shape::Circle::new(CREATURE_SIZE / 2.0).into())
+                        .into(),
                     materials.add(ColorMaterial::from(PREY_COLOR)),
                     FIELD_SIZE,
                     CREATURE_SIZE,
@@ -210,7 +216,7 @@ fn add_prey(
     }
 }
 
-fn set_creature_movement(
+fn manual_creature_movement(
     keys: Res<Input<KeyCode>>,
     mut creature_query: Query<&mut Creature, With<Prey>>,
 ) {
@@ -220,38 +226,41 @@ fn set_creature_movement(
     let mut angular_speed = creature.angular_speed;
 
     if keys.just_pressed(KeyCode::W) {
-        speed = 50.0;
+        speed = 50.0
     }
     if keys.just_released(KeyCode::W) {
-        speed = 0.0;
+        speed = 0.0
     }
 
     if keys.just_pressed(KeyCode::A) {
-        angular_speed = 2.0;
+        angular_speed = 1.0;
     }
-    if keys.just_released(KeyCode::A) {
-        angular_speed = 0.0;
-    }
-
     if keys.just_pressed(KeyCode::D) {
-        angular_speed = -2.0;
+        angular_speed = -1.0;
     }
-    if keys.just_released(KeyCode::D) {
+    if keys.just_released(KeyCode::A) || keys.just_released(KeyCode::D) {
         angular_speed = 0.0;
     }
 
-    creature.set_speed(speed, angular_speed);
+    creature.set_speed(speed, angular_speed)
 }
 
-fn move_creature(
-    mut creature_query: Query<(&mut Creature, &mut Transform), With<Prey>>,
-    time: Res<Time>,
-) {
-    let (mut creature, transform) = creature_query.single_mut();
+fn move_creatures(mut creature_query: Query<(&Creature, &mut Velocity, &mut Transform)>) {
+    for (creature, mut velocity, transform) in creature_query.iter_mut() {
+        let (speed, angular_speed) = creature.get_speed();
 
-    let delta_t = time.delta().as_secs_f32();
+        velocity.angvel = if angular_speed == 0.0 {
+            velocity.angvel
+        } else {
+            angular_speed
+        };
 
-    creature.perform_move(delta_t, transform);
+        velocity.linvel = if speed == 0.0 {
+            velocity.linvel
+        } else {
+            transform.local_y().xy() * speed
+        };
+    }
 }
 
 fn update_energy(
@@ -264,13 +273,23 @@ fn update_energy(
     for mut creature in prey_query.iter_mut() {
         let energy;
 
-        if creature.speed == 0.0 {
+        println!("{} - {}", creature.energy, creature.get_only_speed());
+
+        if creature.get_only_speed() == 0.0 {
             energy = creature.energy + PREY_ENERGY_PROPAGATION_RATE * delta_t;
+
+            if energy >= ENERGY_THRESHHOLD {
+                creature.has_energy = true;
+            }
         } else {
             energy = creature.energy - PREY_ENERGY_REDUCTION_RATE * delta_t;
+
+            if energy <= 0.0 {
+                creature.has_energy = false;
+            }
         }
 
-        creature.set_energy(energy)
+        creature.set_energy(energy);
     }
 }
 
@@ -282,9 +301,9 @@ impl Plugin for CreaturePlugin {
             .add_startup_system(add_prey)
             .add_system_set(
                 SystemSet::new()
-                    .with_system(set_creature_movement)
-                    .with_system(move_creature.after(set_creature_movement))
-                    .with_system(update_energy.after(set_creature_movement)),
+                    .with_system(manual_creature_movement)
+                    .with_system(update_energy.after(move_creatures))
+                    .with_system(move_creatures.after(manual_creature_movement)),
             );
     }
 }
